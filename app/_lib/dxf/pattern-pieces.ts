@@ -62,6 +62,8 @@ export interface PatternFile {
 }
 
 const TOL = 0.05; // drawing-unit tolerance when matching vertices across layers
+/** How far an outline vertex may be from a dense curve and still count as on it (mm) */
+const ON_CURVE_TOL = 0.4;
 
 // ---------- geometry helpers ----------
 
@@ -137,53 +139,150 @@ export function spliceDenseCurves(
 ): Vec[] {
   if (dense.length === 0 || coarse.length < 2) return coarse;
 
+  const curves = dense.map((pts) => ({
+    pts,
+    // Only wrap around the end of a dense curve if it really closes on itself;
+    // CLO closes open curves with a bogus chord.
+    closesItself: pts.length > 2 && dist(pts[0], pts[pts.length - 1]) < 1,
+  }));
+
+  // Where each coarse vertex sits on a dense curve: curve c, position s along it
+  // (segment index + fraction). Turn points CLO adds on a curve (e.g. where a centre
+  // line meets a hem) lie on the curve but between its vertices, so match by
+  // distance to the curve, not to its vertices.
+  // A point can lie on several curves (where two of them meet), so keep the best
+  // position on each curve.
   const locate = (p: Vec) => {
-    for (let c = 0; c < dense.length; c++) {
-      const pts = dense[c];
-      for (let i = 0; i < pts.length; i++) {
-        if (dist(p, pts[i]) < TOL) return { c, i };
+    const hits: { c: number; s: number; d: number }[] = [];
+    curves.forEach(({ pts }, c) => {
+      let best: { c: number; s: number; d: number } | null = null;
+      for (let i = 0; i + 1 < pts.length; i++) {
+        const a = pts[i];
+        const b = pts[i + 1];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const l2 = dx * dx + dy * dy;
+        const t =
+          l2 === 0
+            ? 0
+            : Math.max(
+                0,
+                Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2),
+              );
+        const d = dist(p, { x: a.x + t * dx, y: a.y + t * dy });
+        if (d < ON_CURVE_TOL && (best === null || d < best.d)) {
+          best = { c, s: i + t, d };
+        }
       }
-    }
-    return null;
+      if (best) hits.push(best);
+    });
+    return hits;
   };
   const found = coarse.map(locate);
-  const used = new Set(
-    found.filter((f) => f !== null).map((f) => `${f!.c}:${f!.i}`),
-  );
+
+  const EPS = 1e-6;
+  // Indices of dense vertices strictly between positions sa and sb, walking
+  // forwards (dir 1) or backwards (dir -1) along the curve.
+  const between = (c: number, sa: number, sb: number, dir: 1 | -1) => {
+    const { pts, closesItself } = curves[c];
+    const n = pts.length;
+    const idx: number[] = [];
+    if (dir === 1) {
+      if (sb >= sa) {
+        for (let k = Math.floor(sa + EPS) + 1; k < sb - EPS; k++) idx.push(k);
+      } else {
+        if (!closesItself) return null;
+        for (let k = Math.floor(sa + EPS) + 1; k < n; k++) idx.push(k);
+        for (let k = 0; k < sb - EPS; k++) idx.push(k);
+      }
+    } else {
+      if (sb <= sa) {
+        for (let k = Math.ceil(sa - EPS) - 1; k > sb + EPS; k--) idx.push(k);
+      } else {
+        if (!closesItself) return null;
+        for (let k = Math.ceil(sa - EPS) - 1; k >= 0; k--) idx.push(k);
+        for (let k = n - 1; k > sb + EPS; k--) idx.push(k);
+      }
+    }
+    return idx.map((k) => pts[k]);
+  };
 
   const out: Vec[] = [];
   const edges = closed ? coarse.length : coarse.length - 1;
   for (let k = 0; k < coarse.length; k++) {
     out.push(coarse[k]);
     if (k >= edges) break;
+    const next = (k + 1) % coarse.length;
     const fa = found[k];
-    const fb = found[(k + 1) % coarse.length];
-    if (!fa || !fb || fa.c !== fb.c) continue;
-    const pts = dense[fa.c];
-    const n = pts.length;
-    // Only wrap around the end of the dense curve if it really closes on itself
-    const closesItself = n > 2 && dist(pts[0], pts[n - 1]) < 1;
-    const run: Vec[] = [];
-    let ok = true;
-    for (let i = (fa.i + 1) % n; i !== fb.i; i = (i + 1) % n) {
-      if (i === 0 && !closesItself) {
-        ok = false;
-        break;
-      }
-      if (used.has(`${fa.c}:${i}`) || run.length > n) {
-        ok = false;
-        break;
-      }
-      run.push(pts[i]);
-    }
-    if (fb.i === 0 && fa.i !== n - 1 && !closesItself) ok = false;
-    if (!ok) continue;
+    const fb = found[next];
+    if (fa.length === 0 && fb.length === 0) continue;
     const a = coarse[k];
-    const b = coarse[(k + 1) % coarse.length];
-    // A curve between two points is never much longer than the chord; if it is,
-    // the run went the wrong way round.
-    if (pathLength([a, ...run, b]) > 3 * dist(a, b) + 5) continue;
-    out.push(...run);
+    const b = coarse[next];
+    const others = coarse.filter(
+      (o, j) => j !== k && j !== next && dist(o, a) > TOL && dist(o, b) > TOL,
+    );
+    const chord = dist(a, b);
+
+    // Candidate point sequences strictly between a and b
+    const candidates: Vec[][] = [];
+    // Both ends on the same curve: follow it between them
+    for (const pa of fa) {
+      for (const pb of fb) {
+        if (pa.c !== pb.c) continue;
+        for (const dir of [1, -1] as const) {
+          const run = between(pa.c, pa.s, pb.s, dir);
+          if (run) candidates.push(run);
+        }
+      }
+    }
+    // Only one end on a curve: the edge may run straight to where the curve starts
+    // and then follow it (e.g. a pocket line that is straight at a corner and curves
+    // after). The curve's free end must then lie along the edge.
+    const oneEnded = [
+      ...fa
+        .filter((pa) => !fb.some((pb) => pb.c === pa.c))
+        .map((pos) => ({ pos, atStart: true })),
+      ...fb
+        .filter((pb) => !fa.some((pa) => pa.c === pb.c))
+        .map((pos) => ({ pos, atStart: false })),
+    ];
+    for (const { pos, atStart } of oneEnded) {
+      const { pts, closesItself } = curves[pos.c];
+      if (closesItself) continue;
+      const endTol = Math.max(1, 0.05 * chord);
+      for (const endIndex of [0, pts.length - 1]) {
+        const end = pts[endIndex];
+        // The end the matched point already sits on leads nowhere
+        if (dist(end, atStart ? a : b) < ON_CURVE_TOL) continue;
+        if (closestOnPolyline(end, [a, b], false).d > endTol) continue;
+        for (const dir of [1, -1] as const) {
+          const run = atStart
+            ? between(pos.c, pos.s, endIndex, dir)
+            : between(pos.c, endIndex, pos.s, dir);
+          if (run) candidates.push(atStart ? [...run, end] : [end, ...run]);
+        }
+      }
+    }
+
+    let bestRun: Vec[] | null = null;
+    for (const run of candidates) {
+      const path = [a, ...run, b];
+      // A curve between two points is never much longer than the chord; if it is,
+      // the run went the wrong way round.
+      if (pathLength(path) > 3 * dist(a, b) + 5) continue;
+      // The run must not pass another vertex of the outline (that would skip it)
+      if (
+        others.some((o) => closestOnPolyline(o, path, false).d < ON_CURVE_TOL)
+      )
+        continue;
+      if (
+        bestRun === null ||
+        pathLength(path) < pathLength([a, ...bestRun, b])
+      ) {
+        bestRun = run;
+      }
+    }
+    if (bestRun) out.push(...bestRun);
   }
   return out;
 }

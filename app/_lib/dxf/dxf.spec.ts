@@ -1,6 +1,7 @@
 import fs from "fs";
 import { parseDxf } from "@/_lib/dxf/parse-dxf";
 import {
+  spliceDenseCurves,
   closestOnPolyline,
   polygonArea,
   readPatternFile,
@@ -129,6 +130,65 @@ describe("parseDxf", () => {
     const kinds = doc.blocks["Pattern_1_M"].entities.map((e) => e.type);
     expect(kinds.filter((k) => k === "POLYLINE")).toHaveLength(4);
     expect(doc.entities.map((e) => e.type)).toEqual(["TEXT", "INSERT"]);
+  });
+});
+
+describe("spliceDenseCurves", () => {
+  // A hem curve sampled every 2.5mm, as CLO writes it on layer 84
+  const hem = Array.from({ length: 81 }, (_, i) => {
+    const x = i * 2.5;
+    return { x, y: 0.002 * (x - 100) ** 2 };
+  });
+  const maxGap = (pts: { x: number; y: number }[]) =>
+    Math.max(
+      ...pts.slice(1).map((p, i) => Math.hypot(p.x - pts[i].x, p.y - pts[i].y)),
+    );
+
+  it("follows the curve through a turn point that lies between its vertices", () => {
+    // CLO adds a turn point where a centre line meets the hem: on the curve, but
+    // not one of the dense curve's vertices (x = 101.3 is between 100 and 102.5)
+    const centre = { x: 101.3, y: 0.002 * 1.3 ** 2 + 0.1 };
+    const coarse = [hem[0], hem[20], centre, hem[60], hem[80]];
+    const out = spliceDenseCurves(coarse, [hem], false);
+    expect(out).toContainEqual(centre);
+    expect(maxGap(out)).toBeLessThan(3); // no long straight chords left
+  });
+
+  it("follows a dense curve written in the opposite direction", () => {
+    const coarse = [hem[0], hem[40], hem[80]];
+    const out = spliceDenseCurves(coarse, [[...hem].reverse()], false);
+    expect(out).toHaveLength(81);
+    expect(maxGap(out)).toBeLessThan(3);
+  });
+
+  it("runs straight to where a curve starts when only one end is on it", () => {
+    // Pocket line: straight from a corner for 7.5mm, then the curve. CLO's dense
+    // curve only covers the curved part, so the corner is not on it.
+    const corner = { x: -7.5, y: hem[0].y };
+    const out = spliceDenseCurves([corner, hem[40]], [hem.slice(0, 41)], false);
+    expect(out[0]).toEqual(corner);
+    expect(out[1]).toEqual(hem[0]);
+    expect(out).toHaveLength(42);
+    expect(maxGap(out)).toBeLessThan(8);
+  });
+
+  it("follows both curves through the point where they meet", () => {
+    // CLO splits a line into several dense curves; the shared end belongs to both
+    const first = hem.slice(0, 41);
+    const second = hem.slice(40);
+    const out = spliceDenseCurves(
+      [hem[0], hem[40], hem[80]],
+      [second, first],
+      false,
+    );
+    expect(out).toHaveLength(81);
+    expect(maxGap(out)).toBeLessThan(3);
+  });
+
+  it("does not round off a corner that is clearly off the curve", () => {
+    const corner = { x: 100, y: -5 };
+    const out = spliceDenseCurves([hem[0], corner, hem[80]], [hem], false);
+    expect(out).toEqual([hem[0], corner, hem[80]]);
   });
 });
 
